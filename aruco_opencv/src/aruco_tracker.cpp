@@ -23,12 +23,13 @@
 
 #include <opencv2/aruco.hpp>
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core/quaternion.hpp>
 
 #include "yaml-cpp/yaml.h"
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
-#include "cv_bridge/cv_bridge.hpp"
+#include "cv_bridge/cv_bridge.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
@@ -44,6 +45,7 @@
 #include "aruco_opencv/utils.hpp"
 #include "aruco_opencv/parameters.hpp"
 
+
 using rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface;
 
 namespace aruco_opencv
@@ -51,6 +53,7 @@ namespace aruco_opencv
 
 class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
 {
+  protected:
   // Parameters
   std::string cam_base_topic_;
   bool image_is_rectified_;
@@ -64,6 +67,12 @@ class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
   int image_sub_qos_depth_;
   std::string image_transport_;
   std::string board_descriptions_path_;
+
+  //
+  int tag_0_id_;
+  std::string tag_0_dummy_topic;
+  int tag_1_id_;
+  std::string tag_1_dummy_topic;
 
   // ROS
   OnSetParametersCallbackHandle::SharedPtr on_set_parameter_callback_handle_;
@@ -226,6 +235,10 @@ public:
 protected:
   void declare_parameters()
   {
+    declare_param(*this, "tag_0.id", 0);
+    declare_param(*this, "tag_1.id", 0);
+    declare_param(*this, "tag_0.pose_topic", "/tag_0_dummy_pose");
+    declare_param(*this,"tag_1.pose_topic", "/tag_1_dummy_pose");
     declare_param(*this, "cam_base_topic", "camera/image_raw");
     declare_param(*this, "image_is_rectified", false, false);
     declare_param(*this, "output_frame", "");
@@ -246,6 +259,11 @@ protected:
 
   void retrieve_parameters()
   {
+    get_parameter("tag_0.id", tag_0_id_);
+    get_parameter("tag_1.id", tag_1_id_);
+    get_parameter("tag_0.pose_topic", tag_0_dummy_topic);
+    get_parameter("tag_1.pose_topic", tag_1_dummy_topic);
+
     get_param(*this, "cam_base_topic", cam_base_topic_, "Camera Base Topic: ");
 
     get_parameter("image_is_rectified", image_is_rectified_);
@@ -570,8 +588,269 @@ public:
   }
 };
 
+class ArucoTrackerDummy : public ArucoTracker
+{
+rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr tag_0_pose_sub_;
+rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr tag_1_pose_sub_;
+
+//todo: read these from ROS parameters
+std::vector<std::string> tag_frame_ids_;
+
+void getTagTransforms(std::string source_frame_id, std::vector<std::string> tag_frame_ids, std::vector<cv::Vec3d>& tVecs, std::vector<cv::Vec3d>& rVecs)
+{
+  for( std::string tag_frame_id: tag_frame_ids )
+  {
+    // Look up for the transformation between tag frame and source frame
+      geometry_msgs::msg::TransformStamped t;
+      try {
+        t = tf_buffer_->lookupTransform(
+          source_frame_id, tag_frame_id,
+          tf2::TimePointZero);
+      } catch (const tf2::TransformException & ex) {
+        RCLCPP_INFO(
+          get_logger(), "Could not transform %s to %s: %s",
+          source_frame_id.c_str(), tag_frame_id.c_str(), ex.what());
+        return;
+      }
+      //RCLCPP_INFO(
+      //    get_logger(), "Got Transform for %s: x: %f, y: %f, z: %f",
+      //    tag_frame_id.c_str(), t.transform.translation.x, t.transform.translation.y, t.transform.translation.z);
+      //// Create translation and rotation vectors (tVec and rVec) ////
+      // copy transform rotation quaternion to a vector. Note that opencv uses w, x, y, z while ROS uses x, y, z, w order
+      cv::Vec4d tag_quat_vec(t.transform.rotation.w, t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z);
+      // create the quaternion from the vector
+      cv::Quat tag_quat(tag_quat_vec);
+
+      // convert the quaternion to a rotation vector. This is a simplified Rodrigues matrix that opencv uses
+      // Append this to the output rotation vector vector
+      rVecs.push_back(tag_quat.toRotVec());
+      // Create a translation vector and append this to the output translation vector vector
+      tVecs.push_back(cv::Vec3d(t.transform.translation.x, t.transform.translation.y, t.transform.translation.z));
+  }
+  RCLCPP_INFO(
+          get_logger(), "tVecs size: %d\n rVecs size: %d",
+          tVecs.size(), rVecs.size());
+
+}
+
+void TFtoAruco(std::string source_frame_id, std::vector<std::string> tag_frame_ids, aruco_opencv_msgs::msg::ArucoDetection& detection)
+{
+  std::vector<aruco_opencv_msgs::msg::MarkerPose>& marker_vec = detection.markers;
+  for( std::string tag_frame_id: tag_frame_ids )
+  {
+    // Look up for the transformation between tag frame and source frame
+      geometry_msgs::msg::TransformStamped t;
+      aruco_opencv_msgs::msg::MarkerPose marker;
+      try {
+        t = tf_buffer_->lookupTransform(
+          source_frame_id, tag_frame_id,
+          tf2::TimePointZero);
+      } catch (const tf2::TransformException & ex) {
+        RCLCPP_INFO(
+          get_logger(), "Could not transform %s to %s: %s",
+          source_frame_id.c_str(), tag_frame_id.c_str(), ex.what());
+        return;
+      }
+      marker.pose.orientation = t.transform.rotation;
+      marker.pose.position.x = t.transform.translation.x;
+      marker.pose.position.y = t.transform.translation.y;
+      marker.pose.position.z = t.transform.translation.z;
+      //TODO: Get tag ID from ROS parameters
+      // this is just a basic way to add IDs
+      if (tag_frame_id == tag_frame_ids_[0]){marker.marker_id = 0;}
+      else {marker.marker_id = 1;}
+      marker_vec.push_back(marker);
+  }
+
+}
+
+public:
+  explicit ArucoTrackerDummy(rclcpp::NodeOptions options)
+  : ArucoTracker(options)
+  {
+    
+  }
+  LifecycleNodeInterface::CallbackReturn on_activate(const rclcpp_lifecycle::State & state)
+  {
+    RCLCPP_INFO(get_logger(), "Activating");
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+    if (transform_poses_) {
+      
+      
+    }
+
+    LifecycleNode::on_activate(state);
+
+    detection_pub_->on_activate();
+    debug_pub_->on_activate();
+
+    on_set_parameter_callback_handle_ =
+      add_on_set_parameters_callback(
+      std::bind(
+        &ArucoTrackerDummy::callback_on_set_parameters,
+        this, std::placeholders::_1));
+
+    RCLCPP_INFO(get_logger(), "Waiting for first camera info...");
+
+    cam_info_retrieved_ = false;
+
+    std::string cam_info_topic = image_transport::getCameraInfoTopic(cam_base_topic_);
+    cam_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
+      cam_info_topic, 1,
+      std::bind(&ArucoTrackerDummy::callback_camera_info, this, std::placeholders::_1));
+
+    rmw_qos_profile_t image_sub_qos = rmw_qos_profile_default;
+    image_sub_qos.reliability =
+      static_cast<rmw_qos_reliability_policy_t>(image_sub_qos_reliability_);
+    image_sub_qos.durability = static_cast<rmw_qos_durability_policy_t>(image_sub_qos_durability_);
+    image_sub_qos.depth = image_sub_qos_depth_;
+
+    auto qos = rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(image_sub_qos), image_sub_qos);
+
+    img_sub_ = create_subscription<sensor_msgs::msg::Image>(
+      cam_base_topic_, qos, std::bind(
+        &ArucoTrackerDummy::callback_image, this, std::placeholders::_1));
+
+    return LifecycleNodeInterface::CallbackReturn::SUCCESS;
+  }
+protected:
+  void callback_image(const sensor_msgs::msg::Image::ConstSharedPtr img_msg)
+    {
+      RCLCPP_DEBUG_STREAM(get_logger(), "Image message address [SUBSCRIBE]:\t" << img_msg.get());
+
+      if (!cam_info_retrieved_) {
+        return;
+      }
+      if (img_msg->header.stamp == last_msg_stamp_) {
+        RCLCPP_DEBUG(
+          get_logger(),
+          "The new image has the same timestamp as the previous one (duplicate frame?). Ignoring...");
+        return;
+      }
+      last_msg_stamp_ = img_msg->header.stamp;
+
+      auto callback_start_time = get_clock()->now();
+
+      // Convert the image
+      auto cv_ptr = cv_bridge::toCvShare(img_msg);
+
+      std::vector<int> marker_ids;
+      std::vector<std::vector<cv::Point2f>> marker_corners;
+
+      // TODO(bjsowa): mutex
+      /*
+      cv::aruco::detectMarkers(
+        cv_ptr->image, dictionary_, marker_corners, marker_ids,
+        detector_parameters_);
+      */
+
+      cv::Mat rVec(3, 1, cv::DataType<double>::type); // Camera's rotation vector (no rotation, we're in the camera frame)
+      rVec.at<double>(0) = 0.0;
+      rVec.at<double>(1) = 0.0;
+      rVec.at<double>(2) = 0.0;
+
+      cv::Mat tVec(3, 1, cv::DataType<double>::type); // Camera's translation vector (no translation, we're in the camera frame)
+      tVec.at<double>(0) = 0.0;
+      tVec.at<double>(1) = 0.0;
+      tVec.at<double>(2) = 0.0;
+
+
+      aruco_opencv_msgs::msg::ArucoDetection detection;
+      detection.header.frame_id = img_msg->header.frame_id;
+      detection.header.stamp = img_msg->header.stamp;
+      
+      //geometry_msgs::msg::TransformStamped t;
+      
+      // frame of image to draw on for debug
+      //TODO: Get this from the image message (i.e. img_msg->header.frame_id)
+      std::string source_frame_id = "camera_color_optical_frame";
+      // TF Frame IDs of the virtual tags
+      // TODO: Get these from ROS parameters
+      tag_frame_ids_ = {"tag_0_link", "tag_1_link"};
+      detection.markers.resize(tag_frame_ids_.size());
+
+      std::vector<cv::Vec3d> tVecs;
+      std::vector<cv::Vec3d> rVecs;
+      getTagTransforms(source_frame_id, tag_frame_ids_, tVecs, rVecs);
+      RCLCPP_INFO(
+          get_logger(), "tVecs size: %d\n rVecs size: %d",
+          tVecs.size(), rVecs.size());
+      /*
+      world_obj_points.push_back(cv::Point3d(t.transform.translation.x, t.transform.translation.y, t.transform.translation.z));
+      cv::Vec4d tag_quat_vec(t.transform.rotation.w, t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z);
+      cv::Quat tag_quat(tag_quat_vec);
+      cv::Vec3d tag_rvec;
+      tag_rvec = tag_quat.toRotVec();
+
+      cv::Vec3d tag_tvec(t.transform.translation.x, t.transform.translation.y, t.transform.translation.z);
+      */
+      /*
+      auto &clk = *this->get_clock();
+      RCLCPP_INFO_THROTTLE(
+          get_logger(), clk, 100, "Got translation x: %f, y: %f",
+          t.transform.translation.x, t.transform.translation.y);
+      */
+     //world_obj_points.push_back(cv::Point3d(0.01, 0.01, 0.1));
+
+      {
+        std::lock_guard<std::mutex> guard(cam_info_mutex_);
+
+        //cv::projectPoints(world_obj_points, rVec, tVec, camera_matrix_, distortion_coeffs_, projectedPoints);
+      
+      //detection.markers.push_back()
+      //detection_pub_->publish(detection);
+      TFtoAruco(source_frame_id, tag_frame_ids_, detection);
+      detection_pub_->publish(detection);
+      
+        if (debug_pub_->get_subscription_count() > 0) {
+          auto debug_cv_ptr = cv_bridge::toCvCopy(img_msg, "bgr8");
+
+          //cv::circle(debug_cv_ptr->image, projectedPoints[0], 10, cv::Scalar(0, 0, 255), 3);
+          // draw tag axes in debug images
+          try{
+            std::vector<cv::Point3d> world_obj_points;
+            if( 1/*(tVecs.size() == rVecs.size())&&(tVecs.size()>0)*/){
+            for(int i = 0; i < tVecs.size(); i++)
+              {
+                cv::drawFrameAxes(debug_cv_ptr->image, camera_matrix_, distortion_coeffs_, rVecs[i], tVecs[i], 0.02, 1);
+                //std::vector<cv::Point2f> projectedPoints;
+                //world_obj_points[0] = cv::Point3d{detection.markers[i].pose.position.x, detection.markers[i].pose.position.y, detection.markers[i].pose.position.z};
+                //cv::projectPoints(world_obj_points, rVec, tVec, camera_matrix_, distortion_coeffs_, projectedPoints);
+                //cv::putText(debug_cv_ptr->image, std::to_string(i), projectedPoints[0], cv::FONT_HERSHEY_COMPLEX, 1, cv::Scalar(0,255,0),2,false)
+              }
+            }
+          }
+          catch(const cv::Exception& ex){
+            RCLCPP_INFO(
+              get_logger(), "Could not draw tag axes: %s",
+              ex.what());
+            return;
+          }
+          //cv::drawFrameAxes(debug_cv_ptr->image, camera_matrix_, distortion_coeffs_, tag_rvec, tag_tvec, 0.02, 1);
+          std::unique_ptr<sensor_msgs::msg::Image> debug_img =
+            std::make_unique<sensor_msgs::msg::Image>();
+          debug_cv_ptr->toImageMsg(*debug_img);
+          debug_pub_->publish(std::move(debug_img));
+        }
+      }
+
+      auto callback_end_time = get_clock()->now();
+      double whole_callback_duration = (callback_end_time - callback_start_time).seconds();
+      double image_send_duration = (callback_start_time - img_msg->header.stamp).seconds();
+
+      RCLCPP_DEBUG(
+        get_logger(), "Image callback completed. The callback started %.4f s after the image"
+        " frame was grabbed and completed its execution in %.4f s.", image_send_duration,
+        whole_callback_duration);
+      
+    }
+
+};
+
 }  // namespace aruco_opencv
 
 #include "rclcpp_components/register_node_macro.hpp"
 RCLCPP_COMPONENTS_REGISTER_NODE(aruco_opencv::ArucoTracker)
 RCLCPP_COMPONENTS_REGISTER_NODE(aruco_opencv::ArucoTrackerAutostart)
+RCLCPP_COMPONENTS_REGISTER_NODE(aruco_opencv::ArucoTrackerDummy)
