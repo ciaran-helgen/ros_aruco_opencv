@@ -1,0 +1,4 @@
+/**:
+  ros__parameters:
+    tag_frame_ids: ["tag_front_left", "tag_rear_right"]
+    tag_ids: [10, 11]

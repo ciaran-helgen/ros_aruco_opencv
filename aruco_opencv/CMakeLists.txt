@@ -24,6 +24,7 @@ target_link_libraries(${PROJECT_NAME}
   tf2_ros::tf2_ros
   tf2_geometry_msgs::tf2_geometry_msgs
   image_transport::image_transport
+  ${OpenCV_LIBS}
   opencv_aruco
   ${YAML_CPP_LIBRARIES}
 )

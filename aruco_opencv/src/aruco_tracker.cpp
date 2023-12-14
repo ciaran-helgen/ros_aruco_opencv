@@ -23,7 +23,8 @@
 
 #include <opencv2/aruco.hpp>
 #include <opencv2/calib3d.hpp>
-#include <opencv2/core/quaternion.hpp>
+#include <opencv2/core/quaternion.hpp> //for conversions
+#include "opencv2/video/tracking.hpp" //for kalman filter
 
 #include "yaml-cpp/yaml.h"
 
@@ -67,12 +68,25 @@ class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
   int image_sub_qos_depth_;
   std::string image_transport_;
   std::string board_descriptions_path_;
+  bool enable_kalman_filter_;
 
-  //
-  int tag_0_id_;
-  std::string tag_0_dummy_topic;
-  int tag_1_id_;
-  std::string tag_1_dummy_topic;
+  // For dummy tag node
+  // frame ID of tag (from TF)
+  std::vector<std::string> tag_frame_ids_;
+  // ID of 'detected' tag
+  std::vector<int64_t> tag_ids_;
+  std::unordered_map<std::string, int64_t> tag_id_map_;
+
+  std::unordered_map<int64_t, cv::KalmanFilter> tracks_;
+
+  // Kalman filter params
+  cv::KalmanFilter KF_;         // instantiate Kalman Filter
+  
+  int nStates_ = 18;            // the number of states
+  int nMeasurements_ = 6;       // the number of measured states
+  int nInputs_ = 0;             // the number of action control
+  double dt_ = 1/15;            // time between measurements (1/FPS). TODO: Use common param 
+                                // for camera and aruco node launch, or get rate using topic statistics or similar
 
   // ROS
   OnSetParametersCallbackHandle::SharedPtr on_set_parameter_callback_handle_;
@@ -235,10 +249,14 @@ public:
 protected:
   void declare_parameters()
   {
-    declare_param(*this, "tag_0.id", 0);
-    declare_param(*this, "tag_1.id", 0);
-    declare_param(*this, "tag_0.pose_topic", "/tag_0_dummy_pose");
-    declare_param(*this,"tag_1.pose_topic", "/tag_1_dummy_pose");
+    //std::vector<std::string> default_frame_ids({"tag_0_default_link", "tag_1_default_link"});
+    declare_parameter("tag_frame_ids", std::vector<std::string>({"tag_0_default_link", "tag_1_default_link"}));
+
+    //std::vector<int> default_frame_ids({0, 1});
+    declare_parameter("tag_ids", std::vector<int>({0, 1}));
+
+    declare_parameter("enable_kalman_filter", false);
+
     declare_param(*this, "cam_base_topic", "camera/image_raw");
     declare_param(*this, "image_is_rectified", false, false);
     declare_param(*this, "output_frame", "");
@@ -259,10 +277,15 @@ protected:
 
   void retrieve_parameters()
   {
-    get_parameter("tag_0.id", tag_0_id_);
-    get_parameter("tag_1.id", tag_1_id_);
-    get_parameter("tag_0.pose_topic", tag_0_dummy_topic);
-    get_parameter("tag_1.pose_topic", tag_1_dummy_topic);
+    tag_frame_ids_ = get_parameter("tag_frame_ids").as_string_array();
+    tag_ids_ = get_parameter("tag_ids").as_integer_array();
+
+    for (int i = 0; i< tag_frame_ids_.size(); i++)
+    {
+      tag_id_map_[tag_frame_ids_[i]] = tag_ids_[i];
+    }
+
+    get_parameter("enable_kalman_filter", enable_kalman_filter_);
 
     get_param(*this, "cam_base_topic", cam_base_topic_, "Camera Base Topic: ");
 
@@ -425,6 +448,102 @@ protected:
     }
   }
 
+  void initKalmanFilter(cv::KalmanFilter &KF, int nStates, int nMeasurements, int nInputs, double dt)
+  {
+    KF.init(nStates, nMeasurements, nInputs, CV_64F);                 // init Kalman Filter
+    cv::setIdentity(KF.processNoiseCov, cv::Scalar::all(1e-3));       // set process noise
+    cv::setIdentity(KF.measurementNoiseCov, cv::Scalar::all(1e-3));   // set measurement noise
+    cv::setIdentity(KF.errorCovPost, cv::Scalar::all(1));             // error covariance
+                  /* DYNAMIC MODEL */
+    //  [1 0 0 dt  0  0 dt2   0   0 0 0 0  0  0  0   0   0   0]
+    //  [0 1 0  0 dt  0   0 dt2   0 0 0 0  0  0  0   0   0   0]
+    //  [0 0 1  0  0 dt   0   0 dt2 0 0 0  0  0  0   0   0   0]
+    //  [0 0 0  1  0  0  dt   0   0 0 0 0  0  0  0   0   0   0]
+    //  [0 0 0  0  1  0   0  dt   0 0 0 0  0  0  0   0   0   0]
+    //  [0 0 0  0  0  1   0   0  dt 0 0 0  0  0  0   0   0   0]
+    //  [0 0 0  0  0  0   1   0   0 0 0 0  0  0  0   0   0   0]
+    //  [0 0 0  0  0  0   0   1   0 0 0 0  0  0  0   0   0   0]
+    //  [0 0 0  0  0  0   0   0   1 0 0 0  0  0  0   0   0   0]
+    //  [0 0 0  0  0  0   0   0   0 1 0 0 dt  0  0 dt2   0   0]
+    //  [0 0 0  0  0  0   0   0   0 0 1 0  0 dt  0   0 dt2   0]
+    //  [0 0 0  0  0  0   0   0   0 0 0 1  0  0 dt   0   0 dt2]
+    //  [0 0 0  0  0  0   0   0   0 0 0 0  1  0  0  dt   0   0]
+    //  [0 0 0  0  0  0   0   0   0 0 0 0  0  1  0   0  dt   0]
+    //  [0 0 0  0  0  0   0   0   0 0 0 0  0  0  1   0   0  dt]
+    //  [0 0 0  0  0  0   0   0   0 0 0 0  0  0  0   1   0   0]
+    //  [0 0 0  0  0  0   0   0   0 0 0 0  0  0  0   0   1   0]
+    //  [0 0 0  0  0  0   0   0   0 0 0 0  0  0  0   0   0   1]
+    // position
+    KF.transitionMatrix.at<double>(0,3) = dt;
+    KF.transitionMatrix.at<double>(1,4) = dt;
+    KF.transitionMatrix.at<double>(2,5) = dt;
+    KF.transitionMatrix.at<double>(3,6) = dt;
+    KF.transitionMatrix.at<double>(4,7) = dt;
+    KF.transitionMatrix.at<double>(5,8) = dt;
+    KF.transitionMatrix.at<double>(0,6) = 0.5*pow(dt,2);
+    KF.transitionMatrix.at<double>(1,7) = 0.5*pow(dt,2);
+    KF.transitionMatrix.at<double>(2,8) = 0.5*pow(dt,2);
+    // orientation
+    KF.transitionMatrix.at<double>(9,12) = dt;
+    KF.transitionMatrix.at<double>(10,13) = dt;
+    KF.transitionMatrix.at<double>(11,14) = dt;
+    KF.transitionMatrix.at<double>(12,15) = dt;
+    KF.transitionMatrix.at<double>(13,16) = dt;
+    KF.transitionMatrix.at<double>(14,17) = dt;
+    KF.transitionMatrix.at<double>(9,15) = 0.5*pow(dt,2);
+    KF.transitionMatrix.at<double>(10,16) = 0.5*pow(dt,2);
+    KF.transitionMatrix.at<double>(11,17) = 0.5*pow(dt,2);
+        /* MEASUREMENT MODEL */
+    //  [1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+    //  [0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+    //  [0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+    //  [0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0]
+    //  [0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0]
+    //  [0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0]
+    KF.measurementMatrix.at<double>(0,0) = 1;  // x
+    KF.measurementMatrix.at<double>(1,1) = 1;  // y
+    KF.measurementMatrix.at<double>(2,2) = 1;  // z
+    KF.measurementMatrix.at<double>(3,9) = 1;  // roll
+    KF.measurementMatrix.at<double>(4,10) = 1; // pitch
+    KF.measurementMatrix.at<double>(5,11) = 1; // yaw
+  }
+
+  void fillMeasurements( cv::Mat &measurements,
+                    const cv::Vec3d &translation_measured, const cv::Vec3d &rotation_measured)
+  {
+      // Convert rotation matrix to euler angles
+      // cv::Mat measured_eulers(3, 1, CV_64F);
+      // measured_eulers = rotation_measured;
+      // Set measurement to predict
+      measurements.at<double>(0) = translation_measured[0]; // x
+      measurements.at<double>(1) = translation_measured[1]; // y
+      measurements.at<double>(2) = translation_measured[2]; // z
+      measurements.at<double>(3) = rotation_measured[0];      // roll
+      measurements.at<double>(4) = rotation_measured[1];      // pitch
+      measurements.at<double>(5) = rotation_measured[2];      // yaw
+  }
+
+  void updateKalmanFilter( cv::KalmanFilter &KF, cv::Mat &measurement,
+                      cv::Vec3d &translation_estimated, cv::Vec3d &rotation_estimated )
+  {
+      // First predict, to update the internal statePre variable
+      cv::Mat prediction = KF.predict();
+      // The "correct" phase that is going to use the predicted value and our measurement
+      cv::Mat estimated = KF.correct(measurement);
+      // Estimated translation
+      translation_estimated[0] = estimated.at<double>(0);
+      translation_estimated[1] = estimated.at<double>(1);
+      translation_estimated[2] = estimated.at<double>(2);
+      // Estimated euler angles
+      //cv::Mat eulers_estimated(3, 1, CV_64F);
+      rotation_estimated[0] = estimated.at<double>(9);
+      rotation_estimated[1] = estimated.at<double>(10);
+      rotation_estimated[2] = estimated.at<double>(11);
+      // Convert estimated quaternion to rotation matrix
+      //rotation_estimated = euler2rot(eulers_estimated);
+  }
+
+
   void callback_image(const sensor_msgs::msg::Image::ConstSharedPtr img_msg)
   {
     RCLCPP_DEBUG_STREAM(get_logger(), "Image message address [SUBSCRIBE]:\t" << img_msg.get());
@@ -456,12 +575,14 @@ protected:
 
     int n_markers = marker_ids.size();
     std::vector<cv::Vec3d> rvec_final(n_markers), tvec_final(n_markers);
+    std::vector<cv::Vec3d> rvec_est_final(n_markers), tvec_est_final(n_markers);
 
     aruco_opencv_msgs::msg::ArucoDetection detection;
     detection.header.frame_id = img_msg->header.frame_id;
     detection.header.stamp = img_msg->header.stamp;
     detection.markers.resize(n_markers);
-
+    cv::Vec3d tvec_est;
+    cv::Vec3d rvec_est;
     {
       std::lock_guard<std::mutex> guard(cam_info_mutex_);
 
@@ -470,12 +591,32 @@ protected:
           for (size_t i = range.start; i < range.end; i++) {
             int id = marker_ids[i];
 
+            // calculate marker poses in camera frame
             cv::solvePnP(
               marker_obj_points_, marker_corners[i], camera_matrix_, distortion_coeffs_,
               rvec_final[i], tvec_final[i], false, cv::SOLVEPNP_IPPE_SQUARE);
 
             detection.markers[i].marker_id = id;
             detection.markers[i].pose = convert_rvec_tvec(rvec_final[i], tvec_final[i]);
+
+            // add markers to tracker
+            if (enable_kalman_filter_) {
+              // check if tag is being tracked already
+              if (tracks_.count(id) == 0){
+                // tag is not being tracked, create KF for it
+                // tracks_[id] calls the default constructor for the KalmanFilter class and adds it to the map
+                // with the id key
+                RCLCPP_INFO(
+                  get_logger(),
+                  "Start tracking new tag with ID %d", id);
+                initKalmanFilter(tracks_[id], nStates_, nMeasurements_, nInputs_, dt_);
+              }
+              // update filter for tracked IDs 
+              cv::Mat measurements(nMeasurements_, 1, CV_64FC1); measurements.setTo(cv::Scalar(0));
+              fillMeasurements(measurements, tvec_final[i], rvec_final[i]);
+              updateKalmanFilter( tracks_[id], measurements,
+                        tvec_est_final[i], rvec_est_final[i]);
+            }
           }
         });
 
@@ -499,7 +640,7 @@ protected:
         }
       }
     }
-
+    
     if (transform_poses_ && n_markers > 0) {
       detection.header.frame_id = output_frame_;
       geometry_msgs::msg::TransformStamped cam_to_output;
@@ -546,16 +687,32 @@ protected:
     }
 
     detection_pub_->publish(detection);
-
     if (debug_pub_->get_subscription_count() > 0) {
       auto debug_cv_ptr = cv_bridge::toCvCopy(img_msg, "bgr8");
       cv::aruco::drawDetectedMarkers(debug_cv_ptr->image, marker_corners, marker_ids);
       {
         std::lock_guard<std::mutex> guard(cam_info_mutex_);
-        for (size_t i = 0; i < n_markers; i++) {
-          cv::drawFrameAxes(
-            debug_cv_ptr->image, camera_matrix_, distortion_coeffs_, rvec_final[i],
-            tvec_final[i], 0.2, 3);
+        if(!enable_kalman_filter_) {
+          for (size_t i = 0; i < n_markers; i++) {
+            cv::drawFrameAxes(
+              debug_cv_ptr->image, camera_matrix_, distortion_coeffs_, rvec_final[i],
+              tvec_final[i], 0.02, 3);
+          }
+        }
+        else {
+          for (size_t i = 0; i < n_markers; i++) {
+            try {
+              cv::drawFrameAxes(
+                debug_cv_ptr->image, camera_matrix_, distortion_coeffs_, rvec_est_final[i],
+                tvec_est_final[i], 0.02, 3);
+            }
+            catch (cv::Exception& ex)
+            {
+              RCLCPP_INFO_STREAM(
+              get_logger(), "Could not draw " << n_markers << " tag(s) axes with " << tvec_est_final.size() << " tvec(s) and " << rvec_est_final.size() << " rvecs because: " << ex.what());
+            return;
+            }
+          }
         }
       }
       std::unique_ptr<sensor_msgs::msg::Image> debug_img =
@@ -593,9 +750,6 @@ class ArucoTrackerDummy : public ArucoTracker
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr tag_0_pose_sub_;
 rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr tag_1_pose_sub_;
 
-//todo: read these from ROS parameters
-std::vector<std::string> tag_frame_ids_;
-
 void getTagTransforms(std::string source_frame_id, std::vector<std::string> tag_frame_ids, std::vector<cv::Vec3d>& tVecs, std::vector<cv::Vec3d>& rVecs)
 {
   for( std::string tag_frame_id: tag_frame_ids )
@@ -627,8 +781,8 @@ void getTagTransforms(std::string source_frame_id, std::vector<std::string> tag_
       // Create a translation vector and append this to the output translation vector vector
       tVecs.push_back(cv::Vec3d(t.transform.translation.x, t.transform.translation.y, t.transform.translation.z));
   }
-  RCLCPP_INFO(
-          get_logger(), "tVecs size: %d\n rVecs size: %d",
+  RCLCPP_DEBUG(
+          get_logger(), "tVecs size: %ld\n rVecs size: %ld",
           tVecs.size(), rVecs.size());
 
 }
@@ -657,8 +811,9 @@ void TFtoAruco(std::string source_frame_id, std::vector<std::string> tag_frame_i
       marker.pose.position.z = t.transform.translation.z;
       //TODO: Get tag ID from ROS parameters
       // this is just a basic way to add IDs
-      if (tag_frame_id == tag_frame_ids_[0]){marker.marker_id = 0;}
-      else {marker.marker_id = 1;}
+      //if (tag_frame_id == tag_frame_ids_[0]){marker.marker_id = tag_ids_[0];}
+      //else {marker.marker_id = tag_ids_[1];}
+      marker.marker_id = tag_id_map_[tag_frame_id];
       marker_vec.push_back(marker);
   }
 
@@ -767,14 +922,14 @@ protected:
       std::string source_frame_id = "camera_color_optical_frame";
       // TF Frame IDs of the virtual tags
       // TODO: Get these from ROS parameters
-      tag_frame_ids_ = {"tag_0_link", "tag_1_link"};
+      //tag_frame_ids_ = {"tag_0_link", "tag_1_link"};
       detection.markers.resize(tag_frame_ids_.size());
 
       std::vector<cv::Vec3d> tVecs;
       std::vector<cv::Vec3d> rVecs;
       getTagTransforms(source_frame_id, tag_frame_ids_, tVecs, rVecs);
-      RCLCPP_INFO(
-          get_logger(), "tVecs size: %d\n rVecs size: %d",
+      RCLCPP_DEBUG(
+          get_logger(), "tVecs size: %ld\n rVecs size: %ld",
           tVecs.size(), rVecs.size());
       /*
       world_obj_points.push_back(cv::Point3d(t.transform.translation.x, t.transform.translation.y, t.transform.translation.z));
