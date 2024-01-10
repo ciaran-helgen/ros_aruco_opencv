@@ -151,7 +151,7 @@ public:
 
     detection_pub_ = create_publisher<aruco_opencv_msgs::msg::ArucoDetection>(
       "aruco_detections", 5);
-    debug_pub_ = create_publisher<sensor_msgs::msg::Image>("~/debug", 5);
+    debug_pub_ = create_publisher<sensor_msgs::msg::Image>("~/"+output_frame_+"/debug", 5);
 
     return LifecycleNodeInterface::CallbackReturn::SUCCESS;
   }
@@ -667,7 +667,7 @@ protected:
         geometry_msgs::msg::TransformStamped transform;
         transform.header.stamp = detection.header.stamp;
         transform.header.frame_id = detection.header.frame_id;
-        transform.child_frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
+        transform.child_frame_id = detection.header.frame_id + "/" + std::string("marker_") + std::to_string(marker_pose.marker_id);
         tf2::Transform tf_transform;
         tf2::fromMsg(marker_pose.pose, tf_transform);
         transform.transform = tf2::toMsg(tf_transform);
