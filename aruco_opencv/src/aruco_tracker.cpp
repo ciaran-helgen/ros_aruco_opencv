@@ -20,6 +20,8 @@
 
 #include <mutex>
 #include <chrono>
+#include <algorithm>
+#include <functional>
 
 #include <opencv2/aruco.hpp>
 #include <opencv2/calib3d.hpp>
@@ -69,6 +71,8 @@ class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
   std::string image_transport_;
   std::string board_descriptions_path_;
   bool enable_kalman_filter_;
+  float filter_process_noise_;
+  float filter_measurement_noise_;
 
   // For dummy tag node
   // frame ID of tag (from TF)
@@ -150,8 +154,16 @@ public:
     }
 
     detection_pub_ = create_publisher<aruco_opencv_msgs::msg::ArucoDetection>(
-      "aruco_detections", 5);
-    debug_pub_ = create_publisher<sensor_msgs::msg::Image>("~/"+output_frame_+"/debug", 5);
+      "~/aruco_detections", 5);
+    if(!output_frame_.empty())
+    {
+      debug_pub_ = create_publisher<sensor_msgs::msg::Image>("~/" + output_frame_ +"/debug", 5);
+    }
+    else
+    {
+      debug_pub_ = create_publisher<sensor_msgs::msg::Image>("~/debug", 5);
+    }
+    
 
     return LifecycleNodeInterface::CallbackReturn::SUCCESS;
   }
@@ -250,12 +262,16 @@ protected:
   void declare_parameters()
   {
     //std::vector<std::string> default_frame_ids({"tag_0_default_link", "tag_1_default_link"});
+    // static transform frame (container_base_link -> tag_link) for dummy mode. Instead of
+    // generating TF from detected tag, virtual tag is placed in the image based on received TF
     declare_parameter("tag_frame_ids", std::vector<std::string>({"tag_0_default_link", "tag_1_default_link"}));
 
     //std::vector<int> default_frame_ids({0, 1});
     declare_parameter("tag_ids", std::vector<int>({0, 1}));
 
     declare_parameter("enable_kalman_filter", false);
+    declare_parameter("process_noise", 1e-3);
+    declare_parameter("measurement_noise", 1e-3);
 
     declare_param(*this, "cam_base_topic", "camera/image_raw");
     declare_param(*this, "image_is_rectified", false, false);
@@ -286,6 +302,10 @@ protected:
     }
 
     get_parameter("enable_kalman_filter", enable_kalman_filter_);
+    get_parameter("process_noise", filter_process_noise_);
+    RCLCPP_INFO_STREAM(get_logger(), "Filter process noise cov: " << std::scientific << filter_process_noise_);
+    get_parameter("measurement_noise", filter_measurement_noise_);
+    RCLCPP_INFO_STREAM(get_logger(), "Filter measurement noise cov: " << std::scientific << filter_measurement_noise_);
 
     get_param(*this, "cam_base_topic", cam_base_topic_, "Camera Base Topic: ");
 
@@ -451,8 +471,8 @@ protected:
   void initKalmanFilter(cv::KalmanFilter &KF, int nStates, int nMeasurements, int nInputs, double dt)
   {
     KF.init(nStates, nMeasurements, nInputs, CV_64F);                 // init Kalman Filter
-    cv::setIdentity(KF.processNoiseCov, cv::Scalar::all(1e-3));       // set process noise
-    cv::setIdentity(KF.measurementNoiseCov, cv::Scalar::all(1e-3));   // set measurement noise
+    cv::setIdentity(KF.processNoiseCov, cv::Scalar::all(filter_process_noise_));       // set process noise
+    cv::setIdentity(KF.measurementNoiseCov, cv::Scalar::all(filter_measurement_noise_));   // set measurement noise
     cv::setIdentity(KF.errorCovPost, cv::Scalar::all(1));             // error covariance
                   /* DYNAMIC MODEL */
     //  [1 0 0 dt  0  0 dt2   0   0 0 0 0  0  0  0   0   0   0]
@@ -542,7 +562,6 @@ protected:
       // Convert estimated quaternion to rotation matrix
       //rotation_estimated = euler2rot(eulers_estimated);
   }
-
 
   void callback_image(const sensor_msgs::msg::Image::ConstSharedPtr img_msg)
   {
@@ -660,14 +679,21 @@ protected:
         tf2::doTransform(board_pose.pose, board_pose.pose, cam_to_output);
       }
     }
-
+    
     if (publish_tf_ && n_markers > 0) {
       std::vector<geometry_msgs::msg::TransformStamped> transforms;
       for (auto & marker_pose : detection.markers) {
         geometry_msgs::msg::TransformStamped transform;
         transform.header.stamp = detection.header.stamp;
         transform.header.frame_id = detection.header.frame_id;
-        transform.child_frame_id = detection.header.frame_id + "/" + std::string("marker_") + std::to_string(marker_pose.marker_id);
+        
+        if (detection.header.frame_id.empty() == false){
+          transform.child_frame_id = detection.header.frame_id + "/" + std::string("marker_") + std::to_string(marker_pose.marker_id);
+        }
+       
+        else {
+          transform.child_frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
+        }
         tf2::Transform tf_transform;
         tf2::fromMsg(marker_pose.pose, tf_transform);
         transform.transform = tf2::toMsg(tf_transform);
