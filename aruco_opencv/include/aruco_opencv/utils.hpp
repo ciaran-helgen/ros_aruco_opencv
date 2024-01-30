@@ -27,7 +27,7 @@
 #include <opencv2/calib3d.hpp>
 
 #include "geometry_msgs/msg/pose.hpp"
-#include "cv_bridge/cv_bridge.hpp"
+#include "cv_bridge/cv_bridge.h"
 
 namespace aruco_opencv
 {

@@ -10,7 +10,7 @@ find_package(cv_bridge REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(image_transport REQUIRED)
-find_package(OpenCV ${OpenCV_VERSION} REQUIRED COMPONENTS aruco)
+find_package(OpenCV ${OpenCV_VERSION} REQUIRED PATHS "/usr/include/opencv4" COMPONENTS aruco)
 find_package(yaml-cpp REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
@@ -24,6 +24,7 @@ target_link_libraries(${PROJECT_NAME}
   tf2_ros::tf2_ros
   tf2_geometry_msgs::tf2_geometry_msgs
   image_transport::image_transport
+  ${OpenCV_LIBS}
   opencv_aruco
   ${YAML_CPP_LIBRARIES}
 )
@@ -43,6 +44,11 @@ rclcpp_components_register_node(${PROJECT_NAME}
 rclcpp_components_register_node(${PROJECT_NAME}
   PLUGIN "aruco_opencv::ArucoTrackerAutostart"
   EXECUTABLE "aruco_tracker_autostart"
+)
+
+rclcpp_components_register_node(${PROJECT_NAME}
+  PLUGIN "aruco_opencv::ArucoTrackerDummy"
+  EXECUTABLE "aruco_tracker_dummy"
 )
 
 install(
