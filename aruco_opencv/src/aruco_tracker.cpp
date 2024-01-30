@@ -73,6 +73,7 @@ class ArucoTracker : public rclcpp_lifecycle::LifecycleNode
   bool enable_kalman_filter_;
   float filter_process_noise_;
   float filter_measurement_noise_;
+  std::string marker_prefix_; // prepend to marker ID in tf pub for readability
 
   // For dummy tag node
   // frame ID of tag (from TF)
@@ -273,6 +274,8 @@ protected:
     declare_parameter("process_noise", 1e-3);
     declare_parameter("measurement_noise", 1e-3);
 
+    declare_parameter("marker_prefix", "marker_");
+
     declare_param(*this, "cam_base_topic", "camera/image_raw");
     declare_param(*this, "image_is_rectified", false, false);
     declare_param(*this, "output_frame", "");
@@ -332,6 +335,8 @@ protected:
 
     get_parameter("publish_tf", publish_tf_);
     RCLCPP_INFO_STREAM(get_logger(), "TF publishing is " << (publish_tf_ ? "enabled" : "disabled"));
+
+    get_parameter("marker_prefix", marker_prefix_);
 
     get_param(*this, "marker_size", marker_size_, "Marker size: ");
 
@@ -688,11 +693,11 @@ protected:
         transform.header.frame_id = detection.header.frame_id;
         
         if (detection.header.frame_id.empty() == false){
-          transform.child_frame_id = detection.header.frame_id + "/" + std::string("marker_") + std::to_string(marker_pose.marker_id);
+          transform.child_frame_id = std::string(this->get_name()) + "/" + marker_prefix_ + std::to_string(marker_pose.marker_id);
         }
        
         else {
-          transform.child_frame_id = std::string("marker_") + std::to_string(marker_pose.marker_id);
+          transform.child_frame_id = marker_prefix_ + std::to_string(marker_pose.marker_id);
         }
         tf2::Transform tf_transform;
         tf2::fromMsg(marker_pose.pose, tf_transform);
